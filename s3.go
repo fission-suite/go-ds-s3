@@ -2,6 +2,7 @@ package s3ds
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"path"
@@ -18,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/go-redis/cache/v8"
+	"github.com/go-redis/redis/v8"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 )
@@ -40,7 +43,8 @@ const (
 
 type S3Bucket struct {
 	Config
-	S3 *s3.S3
+	S3    *s3.S3
+	Cache *cache.Cache
 }
 
 type Config struct {
@@ -53,6 +57,7 @@ type Config struct {
 	RootDirectory       string
 	Workers             int
 	CredentialsEndpoint string
+	RedisAddr           string
 }
 
 func NewS3Datastore(conf Config) (*S3Bucket, error) {
@@ -96,13 +101,38 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 	}
 	s3obj := s3.New(sess)
 
+	var rcache *cache.Cache
+	if conf.RedisAddr != "" {
+		// Init redis cache
+		rdb := redis.NewClient(&redis.Options{
+			Addr: conf.RedisAddr,
+		})
+
+		rcache = cache.New(&cache.Options{
+			Redis:        rdb,
+			LocalCache:   cache.NewTinyLFU(1000, time.Minute),
+			StatsEnabled: true,
+		})
+	}
+
 	return &S3Bucket{
 		S3:     s3obj,
 		Config: conf,
+		Cache:  rcache,
 	}, nil
 }
 
 func (s *S3Bucket) Put(k ds.Key, value []byte) error {
+	if s.Cache != nil {
+		ctx := context.TODO()
+		s.Cache.Set(&cache.Item{
+			Ctx:   ctx,
+			Key:   k.String(),
+			Value: value,
+			TTL:   time.Hour,
+		})
+	}
+
 	_, err := s.S3.PutObject(&s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
@@ -116,6 +146,15 @@ func (s *S3Bucket) Sync(prefix ds.Key) error {
 }
 
 func (s *S3Bucket) Get(k ds.Key) ([]byte, error) {
+	if s.Cache != nil {
+		var value []byte
+		ctx := context.TODO()
+		err := s.Cache.Get(ctx, k.String(), &value)
+		if err == nil {
+			return value, nil
+		}
+	}
+
 	resp, err := s.S3.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
@@ -157,6 +196,11 @@ func (s *S3Bucket) GetSize(k ds.Key) (size int, err error) {
 }
 
 func (s *S3Bucket) Delete(k ds.Key) error {
+	if s.Cache != nil {
+		ctx := context.TODO()
+		s.Cache.Delete(ctx, k.String())
+	}
+
 	_, err := s.S3.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
